@@ -9,19 +9,15 @@ import org.gradle.api.initialization.dsl.*
 import org.gradle.api.internal.GradleInternal
 import org.gradle.api.plugins.*
 import org.gradle.kotlin.dsl.*
-import org.gradle.process.*
 import java.io.*
 import java.lang.module.ModuleDescriptor.Version
 import java.nio.file.*
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.util.*
-import javax.inject.*
 import kotlin.properties.Delegates.notNull
 
 
-class PythonPlugin @Inject constructor(
-    val execOps: ExecOperations
-) : Plugin<Project> {
+class PythonPlugin : Plugin<Project> {
 
     // Load dependencies from the same buildscript context as the Chaquopy plugin
     // itself, so they'll come from the same repository.
@@ -286,20 +282,6 @@ class PythonPlugin @Inject constructor(
         return ArrayList(abis)
     }
 
-    fun extractResource(name: String, targetDir: File): File {
-        project.mkdir(targetDir)
-        val outFile = File(targetDir, File(name).name)
-        val tmpFile = File("${outFile.path}.tmp")
-        val stream = javaClass.getResourceAsStream(name)
-            ?: throw IOException("getResourceAsString failed for '$name'")
-        Files.copy(stream, tmpFile.toPath(), REPLACE_EXISTING)
-        project.delete(outFile)
-        if (! tmpFile.renameTo(outFile)) {
-            throw IOException("Failed to create '$outFile'")
-        }
-        return outFile
-    }
-
     fun buildSubdir(name: String? = null, variant: Variant? = null): File {
         var result = File(project.buildDir, "python")
         if (name != null) {
@@ -310,6 +292,17 @@ class PythonPlugin @Inject constructor(
         }
         return result
     }
+}
+
+
+fun extractResource(name: String, targetDir: File): File {
+    val outPath = Files.createDirectories(targetDir.toPath()).resolve(name)
+    val tmpPath = Path.of("$outPath.tmp")
+    val stream = PythonPlugin::class.java.getResourceAsStream(name)
+        ?: throw IOException("getResourceAsString failed for '$name'")
+    Files.copy(stream, tmpPath, REPLACE_EXISTING)
+    Files.move(tmpPath, outPath, REPLACE_EXISTING)
+    return outPath.toFile()
 }
 
 

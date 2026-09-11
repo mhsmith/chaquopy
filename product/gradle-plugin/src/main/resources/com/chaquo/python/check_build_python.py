@@ -11,12 +11,6 @@ if actual != expected:
     # $version command: ".
     sys.exit("it is version {}".format(actual))
 
-
-# If any of the following things change, the build environment should be rebuilt.
-# The Gradle plugin will use our stdout as a task input property.
-for name in [
-    "executable",  # In case the PATH changes, or the content of the directories on it.
-    "base_prefix",  # In case a venv is recreated with a different copy of Python.
-    "version",  # In case base_prefix is modified in place.
-]:
-    print("{}={!r}".format(name, getattr(sys, name)))
+# The Gradle plugin will use this path as a file input property, so the build
+# environment will be rebuilt if either the executable's path or content changes.
+print(sys.executable)
