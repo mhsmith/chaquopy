@@ -60,24 +60,21 @@ internal class TaskBuilder(
     }
 
     fun createBuildPackagesTask(): Provider<BuildPackagesTask> {
-        val findExecutableTask = registerTask(
-            "find", "executable", FindPythonExecutableTask::class
+        val findCommandTask = registerTask(
+            "find", "command", FindPythonCommandTask::class
         ) {
             version.set(python.version)
             bpSetting.set(python.buildPython)
-            outputDir.set(plugin.buildSubdir("findExecutable", variant))
+            outputDir.set(plugin.buildSubdir("findCommand", variant))
 
             // We could add the executable search directories as inputs, but that still
-            // wouldn't capture things like the availablility of versions for the `py`
-            // command.
+            // wouldn't detect changes in things like the availablility of versions for
+            // the `py` command.
             outputs.upToDateWhen { false }
         }
 
         return registerTask("extract", "buildPackages", BuildPackagesTask::class) {
-            // Wiring @Internal properties apparently doesn't create a dependency.
-            dependsOn(findExecutableTask)
-            bpExecutable.set(findExecutableTask.get().bpExecutable)
-            bpError.set(findExecutableTask.get().bpError)
+            findCommandDir.set(findCommandTask.get().outputDir)
 
             // Keep the path short to avoid the the Windows 260-character limit.
             outputDir.set(plugin.buildSubdir("env", variant))
@@ -85,18 +82,26 @@ internal class TaskBuilder(
     }
 
     abstract class BuildPackagesTask : OutputDirTask() {
-        @get:InputFile @get:Optional abstract val bpExecutable: RegularFileProperty
-        @get:Input @get:Optional abstract val bpError: Property<String>
+        @get:InputDirectory abstract val findCommandDir: DirectoryProperty
 
         @TaskAction
         override fun run() {
             super.run()
-            if (bpError.isPresent) {
+
+            val findCommandDir = project.file(this@BuildPackagesTask.findCommandDir)
+            val errorFile = findCommandDir.resolve(ERROR_FILENAME)
+            if (errorFile.exists()) {
+                fsOps.copy {
+                    from(errorFile)
+                    into(outputDir)
+                }
                 return
             }
 
+            val command =
+                findCommandDir.resolve(COMMAND_FILENAME).readText().split("\n")
             execOps.exec {
-                executable(bpExecutable.get())
+                commandLine(command)
                 args("-m", "venv", "--without-pip", project.file(outputDir))
             }
 
@@ -110,7 +115,7 @@ internal class TaskBuilder(
             // Pre-generate the __pycache__ directories to avoid the outputDir
             // contents changing and breaking the up to date checks.
             execOps.exec {
-                executable(bpExecutable.get())
+                commandLine(command)
                 args("-Wignore", "-m", "compileall", "-qq",
                     project.file(outputDir))
             }
@@ -526,21 +531,22 @@ internal class TaskBuilder(
     abstract class BuildPythonTask : OutputDirTask() {
         @get:Input abstract val version: Property<String>
         @get:InputDirectory abstract val buildVenv: DirectoryProperty
-        @get:Input @get:Optional abstract val bpError: Property<String>
 
         fun configure(python: PythonExtension, buildPackagesTask: BuildPackagesTask) {
             version.set(python.version)
             buildVenv.set(buildPackagesTask.outputDir)
-            bpError.set(buildPackagesTask.bpError)
         }
 
         fun execBuildPython(args: List<String>) {
-            bpError.getOrNull()?.let {
-                throw ExecException(it)
+            val buildVenv = project.file(buildVenv)
+            val errorFile = buildVenv.resolve(ERROR_FILENAME)
+            if (errorFile.exists()) {
+                throw ExecException(errorFile.readText())
             }
+
             execOps.exec {
                 executable(
-                    buildVenv.get().asFile.resolve(
+                    buildVenv.resolve(
                         if (osName() == "windows") "Scripts/python.exe" else "bin/python"
                     )
                 )
@@ -609,29 +615,29 @@ internal class TaskBuilder(
 
 abstract class PythonTask : DefaultTask() {
     @get:Inject abstract val execOps: ExecOperations
+    @get:Inject abstract val fsOps: FileSystemOperations
 }
 
 
-abstract class FindPythonExecutableTask : OutputDirTask() {
+// This task returns either a Python command line, or an error message explaining why
+// it couldn't find one. It also returns the stdout of check_build_python.py, so we can
+// detect when the build venv needs to be rebuilt.
+//
+// However, Gradle provides no easy way for a task to output anything other than files.
+// Some people suggest connecting @Internal properties of the first task to to @Input
+// properties of the second one, but the Provider documentation doesn't clearly state
+// that this would be safe when the configuration cache is computing and storing
+// property values. So let's just go with the flow and write everything to files.
+abstract class FindPythonCommandTask : OutputDirTask() {
     @get:Input abstract val version: Property<String>
     @get:Input @get:Optional abstract val bpSetting: ListProperty<String>
-
-    // The task will set exactly one of these properties, depending on whether
-    // the executable was found or not. @Output properties are not allowed because
-    // they're finalized before the task is run.
-    @get:Internal abstract val bpExecutable: RegularFileProperty
-    @get:Internal abstract val bpError: Property<String>
 
     @TaskAction
     override fun run() {
         super.run()
         val version = version.get()
         val bpSetting = bpSetting.getOrNull()
-
-        // The documentation is confusing about whether property values might be cached
-        // between runs, so clear them before starting.
-        bpExecutable.set(null as File?)
-        bpError.set(null)
+        val outputDir = project.file(outputDir)
 
         val bps = sequence {
             if (bpSetting != null) {
@@ -650,21 +656,27 @@ abstract class FindPythonExecutableTask : OutputDirTask() {
             }
         }
 
-        val checkScript = extractResource(
-            "check_build_python.py", project.file(outputDir))
+        val checkScript = extractResource("check_build_python.py", outputDir)
         var error: String? = null
         var gotStderr = false
         for (bp in bps) {
             val stdout = ByteArrayOutputStream()
             val stderr = ByteArrayOutputStream()
             try {
-                exec {
-                    commandLine(bp)
+                val bpResolved = ArrayList<String>().apply {
+                    add(findExecutable(bp[0]).toString())
+                    addAll(bp.subList(1, bp.size))
+                }
+                execOps.exec {
+                    commandLine(bpResolved)
                     args(checkScript, version)
                     standardOutput = stdout
                     errorOutput = stderr
                 }
-                bpExecutable.set(File(stdout.toString().trim()))
+                outputDir.resolve(COMMAND_FILENAME).writeText(
+                    bpResolved.joinToString("\n")
+                )
+                outputDir.resolve(STDOUT_FILENAME).writeBytes(stdout.toByteArray())
                 return
             } catch (e: ExecException) {
                 // Prefer stderr over an exception message.
@@ -678,7 +690,7 @@ abstract class FindPythonExecutableTask : OutputDirTask() {
                 }
             }
         }
-        bpError.set(
+        project.file(outputDir).resolve(ERROR_FILENAME).writeText(
             if (bpSetting != null) {
                 "$bpSetting is not a valid Python $version command: $error. " +
                 BUILD_PYTHON_ADVICE
@@ -690,43 +702,40 @@ abstract class FindPythonExecutableTask : OutputDirTask() {
 
     // To reduce differences between platforms, and make testing easier, we resolve
     // executables to absolute paths manually (#1411).
-    fun exec(configure: ExecSpec.() -> Unit) {
-        execOps.exec {
-            configure()
-            var execFile = File(executable)
-            if (!execFile.isAbsolute) {
-                execFile = File(project.projectDir, executable)
+    fun findExecutable(executable: String): File {
+        var execFile = File(executable)
+        if (!execFile.isAbsolute) {
+            execFile = File(project.projectDir, executable)
+        }
+
+        if (execFile.exists()) {
+            return execFile
+        } else {
+            // If the executable contains no slashes, search the PATH.
+            if (File.separator in executable || "/" in executable) {
+                throw ExecException("'$execFile' does not exist")
             }
 
-            if (execFile.exists()) {
-                setExecutable(execFile)
-            } else {
-                // If the executable contains no slashes, search the PATH.
-                if (File.separator in executable || "/" in executable) {
-                    throw ExecException("'$execFile' does not exist")
-                }
+            // For consistency between machines, we don't use the PATHEXT variable.
+            val exts = mutableListOf("")
+            if (osName() == "windows") {
+                exts += listOf(".exe", ".bat")
+            }
 
-                // For consistency between machines, we don't use the PATHEXT variable.
-                val exts = mutableListOf("")
-                if (osName() == "windows") {
-                    exts += listOf(".exe", ".bat")
-                }
-
-                outer@ for (dir in System.getenv("PATH").split(File.pathSeparator)) {
-                    for (ext in exts) {
-                        execFile = File(dir, executable + ext)
-                        if (execFile.exists()) {
-                            break@outer
-                        }
+            outer@ for (dir in System.getenv("PATH").split(File.pathSeparator)) {
+                for (ext in exts) {
+                    execFile = File(dir, executable + ext)
+                    if (execFile.exists()) {
+                        break@outer
                     }
                 }
-                if (execFile.exists()) {
-                    setExecutable(execFile)
-                } else {
-                    throw ExecException(
-                        "Couldn't find '$executable' on the PATH " +
-                        "or in the project directory")
-                }
+            }
+            if (execFile.exists()) {
+                return execFile
+            } else {
+                throw ExecException(
+                    "Couldn't find '$executable' on the PATH " +
+                    "or in the project directory")
             }
         }
     }
@@ -736,6 +745,9 @@ abstract class FindPythonExecutableTask : OutputDirTask() {
 val BUILD_PYTHON_ADVICE =
     "See https://chaquo.com/chaquopy/doc/current/android.html#buildpython."
 
+val ERROR_FILENAME = "error.txt"
+val COMMAND_FILENAME = "command.txt"
+val STDOUT_FILENAME = "stdout.txt"
 
 abstract class OutputDirTask : PythonTask() {
     @get:OutputDirectory
